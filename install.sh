@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="Arun-Apex/pisignage-player-tools"
-TAG="v1.0.1"   # bump when you tag
+TAG="v1.0.1"   # bump when you tag new version
 
 SERVER_URL="${1:-https://digiddpm.com}"
 MODE="${2:-}"  # optional: --prep-for-clone
