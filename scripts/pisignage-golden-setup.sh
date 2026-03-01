@@ -3,11 +3,16 @@ set -euo pipefail
 
 # ============================================================
 # piSignage Golden Player Setup (Pi 4)
-# - Force HDMI audio + hotplug
-# - Force ALSA HDMI output
-# - Set piSignage server URL
-# - Install first-boot identity regen (machine-id + SSH keys)
-# - Optional: --prep-for-clone wipes identity + shutdown
+# - Force HDMI audio + hotplug (boot config)
+# - Force ALSA HDMI output (persistent systemd service)
+# - Set piSignage server URL (player2/package.json + common JSONs)
+# - Install first-boot identity regen (machine-id + SSH keys + optional hostname)
+# - Optional: --prep-for-clone wipes identity + shutdown (for SD cloning)
+#
+# Usage examples:
+#   sudo ./pisignage-golden-setup.sh --server https://digiddpm.com
+#   sudo ./pisignage-golden-setup.sh --server https://digiddpm.com --prep-for-clone
+#   sudo ./pisignage-golden-setup.sh --no-hostname
 # ============================================================
 
 SERVER_URL_DEFAULT="https://digiddpm.com"
@@ -15,12 +20,13 @@ SERVER_URL_DEFAULT="https://digiddpm.com"
 usage() {
   cat <<EOF
 Usage:
-  sudo ./pisignage-golden-setup.sh [--server https://example.com] [--prep-for-clone] [--no-hostname]
+  sudo $0 [--server https://example.com] [--prep-for-clone] [--no-hostname]
 
 Options:
   --server URL         Server URL to set (default: ${SERVER_URL_DEFAULT})
   --prep-for-clone     Wipe SSH host keys + machine-id (so clones regenerate), then shutdown
-  --no-hostname        Do not change hostname (otherwise sets pisignage-<last6serial>)
+  --no-hostname        Do not change hostname (otherwise sets pisignage-<last6serial> on first boot)
+  -h, --help           Show this help
 EOF
 }
 
@@ -63,20 +69,33 @@ done
 
 need_root
 
+if [[ -z "${SERVER_URL}" ]]; then
+  echo "ERROR: --server URL is empty"
+  exit 1
+fi
+
 echo "=== piSignage Golden Setup ==="
 echo "Server URL: ${SERVER_URL}"
 echo "Prep for clone: ${PREP_FOR_CLONE}"
-echo "Set hostname: ${SET_HOSTNAME}"
+echo "Set hostname on first boot: ${SET_HOSTNAME}"
 echo
 
-# ---------- 1) Force HDMI audio + hotplug in /boot/config.txt ----------
-BOOT_CONFIG="/boot/config.txt"
+# ---------- 1) Force HDMI audio + hotplug in boot config ----------
+choose_boot_config() {
+  # Bookworm often uses /boot/firmware/config.txt
+  if [[ -f /boot/firmware/config.txt ]]; then
+    echo "/boot/firmware/config.txt"
+  else
+    echo "/boot/config.txt"
+  fi
+}
+
+BOOT_CONFIG="$(choose_boot_config)"
 if [[ -f "$BOOT_CONFIG" ]]; then
   echo "[1/5] Updating ${BOOT_CONFIG} for HDMI audio..."
-  # Ensure lines exist (idempotent)
   grep -q '^hdmi_drive=2' "$BOOT_CONFIG" || echo 'hdmi_drive=2' >> "$BOOT_CONFIG"
   grep -q '^hdmi_force_hotplug=1' "$BOOT_CONFIG" || echo 'hdmi_force_hotplug=1' >> "$BOOT_CONFIG"
-  echo "  - Added/ensured: hdmi_drive=2, hdmi_force_hotplug=1"
+  echo "  - Ensured: hdmi_drive=2, hdmi_force_hotplug=1"
 else
   echo "[1/5] WARN: ${BOOT_CONFIG} not found. Skipping boot HDMI force."
 fi
@@ -85,13 +104,12 @@ fi
 echo "[2/5] Forcing audio output to HDMI (amixer numid=3 2)..."
 if command -v amixer >/dev/null 2>&1; then
   amixer cset numid=3 2 >/dev/null 2>&1 || true
-  echo "  - amixer set attempted (some images may not expose numid=3, that's OK)."
+  echo "  - amixer set attempted (OK if not supported on some images)."
 else
   echo "  - WARN: amixer not found. Skipping."
 fi
 
-# Make it persistent via a small systemd oneshot service
-echo "  - Installing persistent HDMI audio service..."
+echo "  - Installing persistent HDMI audio systemd service..."
 cat >/etc/systemd/system/force-hdmi-audio.service <<'EOF'
 [Unit]
 Description=Force HDMI audio output
@@ -110,26 +128,52 @@ systemctl daemon-reload
 systemctl enable force-hdmi-audio.service >/dev/null 2>&1 || true
 
 # ---------- 3) Set piSignage server URL ----------
-echo "[3/5] Setting piSignage server URL in config (best-effort)..."
+echo "[3/5] Setting piSignage server URL..."
 
-set_server_in_json() {
+escape_sed_repl() {
+  # Escape for sed replacement
+  printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+SERVER_URL_ESCAPED="$(escape_sed_repl "$SERVER_URL")"
+
+set_server_in_player2_package_json() {
+  local f="/home/pi/player2/package.json"
+  [[ -f "$f" ]] || return 1
+
+  # Update config_server + media_server keys
+  sed -i -E \
+    's/"config_server"\s*:\s*"[^"]*"/"config_server": "'"${SERVER_URL_ESCAPED}"'"/g;
+     s/"media_server"\s*:\s*"[^"]*"/"media_server": "'"${SERVER_URL_ESCAPED}"'"/g' \
+    "$f"
+
+  echo "  - Updated config_server + media_server in: $f"
+  return 0
+}
+
+set_server_in_json_keys() {
   local file="$1"
-  # Only touch files that look like JSON
   [[ -f "$file" ]] || return 1
   [[ "$file" == *.json ]] || return 1
 
-  # If file contains a "server" key, replace it; otherwise try to insert.
-  if grep -qE '"server"\s*:' "$file"; then
-    # Replace existing server value
-    sed -i -E 's/"server"\s*:\s*"[^"]*"/"server": "'"${SERVER_URL//\//\\/}"'"/' "$file" || return 1
-    echo "  - Updated server in: $file"
+  # Replace common server keys if present
+  if grep -qE '"(server|serverUrl|serverURL|serverAddress|serverIp|serverIP|config_server|media_server)"\s*:' "$file"; then
+    sed -i -E \
+      's/"(server|serverUrl|serverURL|serverAddress|serverIp|serverIP|config_server|media_server)"\s*:\s*"[^"]*"/"\1": "'"${SERVER_URL_ESCAPED}"'"/g' \
+      "$file" || return 1
+    echo "  - Updated server-related keys in: $file"
     return 0
   fi
 
   return 1
 }
 
-# Common locations (varies by player version)
+FOUND_ANY="false"
+
+# 3A) Your confirmed location first:
+set_server_in_player2_package_json && FOUND_ANY="true" || true
+
+# 3B) Common fallback locations (other piSignage builds)
 CANDIDATES=(
   "/home/pi/.pisignage/config.json"
   "/home/pi/.pisignage/settings.json"
@@ -137,35 +181,30 @@ CANDIDATES=(
   "/home/pi/.config/pisignage/settings.json"
 )
 
-FOUND_ANY="false"
-
 for f in "${CANDIDATES[@]}"; do
-  if set_server_in_json "$f"; then
+  if set_server_in_json_keys "$f"; then
     FOUND_ANY="true"
   fi
 done
 
-# If not found, do a cautious search for JSON files that contain "server":
+# 3C) If still not found, cautious search
 if [[ "$FOUND_ANY" == "false" ]]; then
-  echo "  - Didn't find known config paths. Searching for JSON containing \"server\" under /home/pi ..."
-
-  # Limit search depth a bit to avoid heavy scanning
-  mapfile -t MATCHES < <(grep -Rsl --include='*.json' '"server"[[:space:]]*:' /home/pi 2>/dev/null | head -n 20 || true)
-
+  echo "  - Didn't find known config paths. Searching JSON under /home/pi for server keys..."
+  mapfile -t MATCHES < <(grep -Rsl --include='*.json' -E '"(server|serverUrl|serverURL|serverAddress|serverIp|serverIP|config_server|media_server)"\s*:' /home/pi 2>/dev/null | head -n 30 || true)
   if [[ "${#MATCHES[@]}" -gt 0 ]]; then
     for m in "${MATCHES[@]}"; do
-      set_server_in_json "$m" && FOUND_ANY="true" || true
+      set_server_in_json_keys "$m" && FOUND_ANY="true" || true
     done
   fi
 fi
 
 if [[ "$FOUND_ANY" == "false" ]]; then
-  echo "  - WARN: Could not locate a JSON file with a \"server\" key to update."
-  echo "          You may need to tell me the exact file path used by your player image."
+  echo "  - WARN: Could not locate any file with server/config_server/media_server keys to update."
+  echo "          (But your report indicates /home/pi/player2/package.json should exist.)"
 fi
 
 # ---------- 4) Install First-Boot Identity Regen ----------
-echo "[4/5] Installing first-boot identity regeneration (SSH keys + machine-id)..."
+echo "[4/5] Installing first-boot identity regeneration (machine-id + SSH keys)..."
 
 cat >/usr/local/sbin/firstboot-identity-fix.sh <<'EOF'
 #!/usr/bin/env bash
@@ -183,7 +222,7 @@ fi
 
 systemctl restart ssh >/dev/null 2>&1 || true
 
-# Optional hostname set from CPU serial (safe)
+# Optional hostname set from CPU serial (Pi)
 if [[ "${SET_HOSTNAME_ON_FIRSTBOOT:-true}" == "true" ]]; then
   SERIAL="$(awk -F ': ' '/Serial/ {print $2}' /proc/cpuinfo | tail -n 1 || true)"
   if [[ -n "$SERIAL" ]]; then
@@ -214,7 +253,6 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-# If user chose --no-hostname, update service env
 if [[ "$SET_HOSTNAME" == "false" ]]; then
   sed -i 's/Environment=SET_HOSTNAME_ON_FIRSTBOOT=true/Environment=SET_HOSTNAME_ON_FIRSTBOOT=false/' \
     /etc/systemd/system/firstboot-identity-fix.service
@@ -230,12 +268,11 @@ if [[ "$PREP_FOR_CLONE" == "true" ]]; then
   echo
   echo "=== PREP FOR CLONE ==="
   echo "Wiping SSH host keys and machine-id so each cloned Pi regenerates unique identity..."
-
   rm -f /etc/ssh/ssh_host_* || true
   truncate -s 0 /etc/machine-id || true
   rm -f /var/lib/dbus/machine-id || true
 
-  # best-effort cache/log cleanup (light)
+  # light cleanup
   rm -rf /var/log/journal/* >/dev/null 2>&1 || true
   sync
 
@@ -245,5 +282,5 @@ else
   echo
   echo "Next:"
   echo "  1) Reboot and test: HDMI audio + piSignage connects to ${SERVER_URL}"
-  echo "  2) When happy, run: sudo $0 --server ${SERVER_URL} --prep-for-clone"
+  echo "  2) If you ever want cloning: run with --prep-for-clone (it will shutdown)"
 fi
