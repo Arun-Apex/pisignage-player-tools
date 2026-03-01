@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="Arun-Apex/pisignage-player-tools"
-TAG="v1.0.4"   # <-- MUST match your new tag
+TAG="v1.0.5"   # <-- MUST match your new tag
 
 SERVER_URL="${1:-https://digiddpm.com}"
 MODE="${2:-}"
